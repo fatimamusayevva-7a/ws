@@ -1,0 +1,525 @@
+flask>=3.0
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+werkzeug>=3.0
+
+"""
+Viva La Diva Bakery — Flask Backend
+Web Təhlükəsizliyi Fənni — Lab Layihəsi
+
+Mühit dəyişənləri:
+  FLASK_SECRET_KEY   — sessiya açarı
+  DATABASE_URL       — postgresql://user:pass@host:5432/dbname
+  WEBSEC_LAB         — 1 olsa lab boşluqları aktiv (default: 1)
+  DEV_INSECURE_SQL   — 1 olsa SQLi zəifliyi aktiv
+  DEV_AUTH_BYPASS    — 1 olsa parol yoxlaması keçilir
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+from flask import Flask, jsonify, request, session, send_from_directory
+
+# ── Qovluq yolları ──────────────────────────────────────────
+BASE_DIR    = Path(__file__).parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+# ── Flask tətbiqi ───────────────────────────────────────────
+app = Flask(__name__, static_folder=None)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(24)
+
+# Vercel-də çərəz parametrləri
+if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+    app.config["SESSION_COOKIE_SECURE"]   = True
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# ── Mühit dəyişənləri ───────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+def _env_flag(*names: str) -> bool:
+    for n in names:
+        v = os.environ.get(n, "").strip().lower()
+        if v in ("1", "true", "yes"):
+            return True
+    return False
+
+# Lab bayraqları
+WEBSEC_LAB        = _env_flag("WEBSEC_LAB") or True          # default aktiv
+DEV_INSECURE_SQL  = _env_flag("DEV_INSECURE_SQL")  or WEBSEC_LAB
+DEV_AUTH_BYPASS   = _env_flag("DEV_AUTH_BYPASS")   or WEBSEC_LAB
+
+
+# ════════════════════════════════════════════════════════════
+#  VERİLƏNLƏR BAZASI
+# ════════════════════════════════════════════════════════════
+
+def get_db():
+    """PostgreSQL bağlantısı açır."""
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL təyin edilməyib!")
+
+    # Vercel üçün SSL əlavə et
+    dsn = DATABASE_URL
+    if os.environ.get("VERCEL"):
+        parsed = urlparse(DATABASE_URL)
+        qs = parse_qs(parsed.query)
+        if "sslmode" not in {k.lower() for k in qs}:
+            qs["sslmode"] = ["require"]
+        dsn = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+    return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
+
+
+# ════════════════════════════════════════════════════════════
+#  İSTİFADƏÇİ — YARDIMÇI FUNKSİYALAR
+# ════════════════════════════════════════════════════════════
+
+def user_get_by_id(user_id: int) -> Optional[Dict]:
+    """İD ilə istifadəçini tapır (parametrləşdirilmiş — TƏHLÜKƏSİZ)."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id, email, full_name, role FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ─── TƏHLÜKƏSİZ: Parametrləşdirilmiş sorğu ─────────────────
+def _user_lookup_safe(email: str) -> Optional[Dict]:
+    """Giriş üçün istifadəçi axtarışı — TƏHLÜKƏSİZ versiya."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT id, email, password_hash, full_name, role FROM users WHERE email = %s",
+        (email,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ─── ZƏİF (LAB): String birləşdirməsi → SQL İnjection ───────
+def _user_lookup_concat(email: str) -> Optional[Dict]:
+    """
+    LAB — DEV_INSECURE_SQL aktiv olanda istifadə olunur.
+    İstifadəçi girişi birbaşa SQL mətninə birləşdirilir!
+
+    Hücum nümunəsi (email sahəsinə yazın):
+      ' OR '1'='1
+      admin@vivaladiva.com'--
+      ' UNION SELECT 1,email,password_hash,full_name,'admin' FROM users--
+    """
+    conn = get_db(); cur = conn.cursor()
+    sql = (
+        "SELECT id, email, password_hash, full_name, role FROM users WHERE email = '"
+        + email   # ← TƏHLÜKƏLİ: birbaşa birləşdirmə!
+        + "'"
+    )
+    print(f"[LAB-SQLi] İcra olunan sorğu: {sql}")  # log üçün
+    try:
+        cur.execute(sql)
+        row = cur.fetchone()
+    except Exception as e:
+        conn.close()
+        raise e
+    conn.close()
+    return dict(row) if row else None
+
+
+# ════════════════════════════════════════════════════════════
+#  API — QEYDİYYAT
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data      = request.get_json(force=True) or {}
+    email     = str(data.get("email",     "")).strip().lower()
+    password  = str(data.get("password",  "")).strip()
+    full_name = str(data.get("full_name", "")).strip()
+
+    if not email or not password:
+        return jsonify({"ok": False, "error": "Email və parol tələb olunur."}), 400
+
+    from werkzeug.security import generate_password_hash
+    pw_hash = generate_password_hash(password)
+
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users (email, password_hash, full_name) VALUES (%s, %s, %s) RETURNING id",
+            (email, pw_hash, full_name)
+        )
+        new_id = cur.fetchone()["id"]
+        conn.commit(); conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": "Bu email artıq mövcuddur."}), 409
+
+    return jsonify({"ok": True, "message": "Qeydiyyat uğurlu oldu!", "user_id": new_id})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — GİRİŞ  (SQLi lab buradadır)
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data     = request.get_json(force=True) or {}
+    email    = str(data.get("email",    "")).strip()
+    password = str(data.get("password", "")).strip()
+
+    if not email or not password:
+        return jsonify({"ok": False, "error": "Email və parol tələb olunur."}), 400
+
+    # ── Lab: SQLi zəifliyi ──────────────────────────────────
+    if DEV_INSECURE_SQL:
+        try:
+            row = _user_lookup_concat(email)   # ← ZƏİF funksiya
+        except Exception as e:
+            # Verilənlər bazası xətasını clientə göstər (lab effekti)
+            return jsonify({
+                "ok": False,
+                "error": "db_error",
+                "db_message": str(e),
+                "sql_fragment": email[:280]
+            }), 200
+    else:
+        row = _user_lookup_safe(email)         # ← TƏHLÜKƏSİZ funksiya
+
+    if row is None:
+        return jsonify({"ok": False, "error": "İstifadəçi tapılmadı."}), 401
+
+    # ── Lab: Parol yoxlamasının keçilməsi ───────────────────
+    if DEV_INSECURE_SQL and DEV_AUTH_BYPASS:
+        pw_ok = True   # ← LAB: parol yoxlanılmır!
+    else:
+        from werkzeug.security import check_password_hash
+        pw_ok = check_password_hash(row["password_hash"], password)
+
+    if not pw_ok:
+        return jsonify({"ok": False, "error": "Parol yanlışdır."}), 401
+
+    # Sessiya yaz
+    db_user = user_get_by_id(row["id"])
+
+    # UNION ilə saxta id gəldisə — sessiya yaratma, sadəcə məlumatı göstər (lab)
+    if db_user is None:
+        probe: Dict[str, Any] = {}
+        for k in row.keys():
+            v = row[k]
+            probe[k] = v.isoformat() if hasattr(v, "isoformat") else v
+        return jsonify({
+            "ok": True,
+            "query_probe": True,
+            "session_created": False,
+            "user": probe,
+            "sql_fragment": email[:280]
+        })
+
+    session["user_id"] = db_user["id"]
+    session["email"]   = db_user["email"]
+    session["role"]    = db_user["role"]
+
+    return jsonify({
+        "ok": True,
+        "message": "Giriş uğurlu!",
+        "user": {
+            "id":        db_user["id"],
+            "email":     db_user["email"],
+            "full_name": db_user["full_name"],
+            "role":      db_user["role"]
+        }
+    })
+
+
+# ════════════════════════════════════════════════════════════
+#  API — ÇIXIŞ / MƏN KİMƏM
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route("/api/me", methods=["GET"])
+def api_me():
+    if "user_id" not in session:
+        return jsonify({"ok": False, "error": "Daxil olmamısınız."}), 401
+    user = user_get_by_id(session["user_id"])
+    return jsonify({"ok": True, "user": user})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — MƏHSULLAR (menyu axtarışı — SQLi lab)
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/products", methods=["GET"])
+def api_products():
+    """
+    Menyu məhsulları — axtarış parametri ilə.
+
+    TƏHLÜKƏSİZ: GET /api/products
+    LAB SQLi:    GET /api/products?search=' OR '1'='1
+    """
+    search = request.args.get("search", "").strip()
+    conn = get_db(); cur = conn.cursor()
+
+    if search and DEV_INSECURE_SQL:
+        # ── ZƏİF: string birləşdirməsi ──────────────────────
+        sql = "SELECT * FROM products WHERE name ILIKE '%" + search + "%'"
+        print(f"[LAB-SQLi] Məhsul axtarışı: {sql}")
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            conn.close()
+            return jsonify({"ok": False, "error": str(e), "sql_fragment": search}), 200
+    elif search:
+        # ── TƏHLÜKƏSİZ: parametrləşdirilmiş ────────────────
+        cur.execute("SELECT * FROM products WHERE name ILIKE %s", (f"%{search}%",))
+    else:
+        cur.execute("SELECT * FROM products ORDER BY id")
+
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "products": rows})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — SİFARİŞLƏR
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/orders", methods=["POST"])
+def api_place_order():
+    """Yeni sifariş yarat."""
+    if "user_id" not in session:
+        return jsonify({"ok": False, "error": "Daxil olun."}), 401
+
+    data         = request.get_json(force=True) or {}
+    product_name = str(data.get("product_name", "")).strip()
+    quantity     = int(data.get("quantity", 1))
+
+    if not product_name:
+        return jsonify({"ok": False, "error": "Məhsul adı tələb olunur."}), 400
+
+    # Qiyməti tap
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT price FROM products WHERE name = %s", (product_name,))
+    prod = cur.fetchone()
+    total = float(prod["price"]) * quantity if prod else 0.0
+
+    cur.execute(
+        "INSERT INTO orders (user_id, product_name, quantity, total) VALUES (%s, %s, %s, %s) RETURNING id",
+        (session["user_id"], product_name, quantity, total)
+    )
+    order_id = cur.fetchone()["id"]
+    conn.commit(); conn.close()
+
+    return jsonify({"ok": True, "order_id": order_id, "total": total})
+
+
+@app.route("/api/orders", methods=["GET"])
+def api_my_orders():
+    """Cari istifadəçinin sifarişləri."""
+    if "user_id" not in session:
+        return jsonify({"ok": False, "error": "Daxil olun."}), 401
+
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM orders WHERE user_id = %s ORDER BY created_at DESC",
+        (session["user_id"],)
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "orders": rows})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — TEK SİFARİŞ  (IDOR nümayişi)
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/orders/<int:oid>", methods=["GET"])
+def api_order_by_id(oid: int):
+    """
+    Tək sifariş.
+
+    IDOR ZƏİFLİYİ (lab):
+      user_id yoxlanılmır → hər kəs /api/orders/1, /api/orders/2 ... ilə
+      başqasının sifarişini görə bilər.
+
+    TƏHLÜKƏSİZ versiya: WHERE id = %s AND user_id = %s
+    """
+    if "user_id" not in session:
+        return jsonify({"ok": False, "error": "Daxil olun."}), 401
+
+    conn = get_db(); cur = conn.cursor()
+
+    if DEV_INSECURE_SQL:
+        # ── ZƏİF: IDOR — user_id yoxlanılmır ───────────────
+        cur.execute("SELECT * FROM orders WHERE id = %s", (oid,))
+    else:
+        # ── TƏHLÜKƏSİZ: yalnız öz sifarişi ─────────────────
+        cur.execute(
+            "SELECT * FROM orders WHERE id = %s AND user_id = %s",
+            (oid, session["user_id"])
+        )
+
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"ok": False, "error": "Sifariş tapılmadı."}), 404
+
+    return jsonify({"ok": True, "order": dict(row)})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — ADMİN PANELİ  (zəif admin yoxlaması)
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/orders", methods=["GET"])
+def api_admin_orders():
+    """
+    Admin paneli — bütün sifarişlər.
+
+    ZƏİF: Yalnız email ilə yoxlanılır (RBAC yoxdur).
+    Hücum: Əgər hər hansı istifadəçi admin@vivaladiva.com emaili ilə
+           qeydiyyatdan keçə bilsəydi — admin panel açılardı.
+    """
+    if "user_id" not in session:
+        return jsonify({"ok": False, "error": "Daxil olun."}), 401
+
+    # ── ZƏİF admin yoxlaması (yoldaşının kodunda da eynidir) ─
+    if session.get("email") != "admin@vivaladiva.com":
+        return jsonify({"ok": False, "error": "Admin hüququnuz yoxdur."}), 403
+
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""
+        SELECT o.id, o.product_name, o.quantity, o.total, o.status,
+               o.created_at, u.email AS user_email, u.full_name
+        FROM orders o
+        JOIN users u ON u.id = o.user_id
+        ORDER BY o.created_at DESC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    return jsonify({"ok": True, "orders": rows, "count": len(rows)})
+
+
+# ════════════════════════════════════════════════════════════
+#  API — HEALTH CHECK
+# ════════════════════════════════════════════════════════════
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({
+        "ok":              True,
+        "app":             "Viva La Diva Bakery",
+        "lab_mode":        WEBSEC_LAB,
+        "insecure_sql":    DEV_INSECURE_SQL,
+        "auth_bypass":     DEV_AUTH_BYPASS
+    })
+
+
+# ════════════════════════════════════════════════════════════
+#  STATİK FAYLLAR (frontend/)
+# ════════════════════════════════════════════════════════════
+
+@app.route("/", defaults={"path": "index.html"})
+@app.route("/<path:path>")
+def serve_file(path):
+    if path.startswith("api/"):
+        return "Tapılmadı", 404
+
+    allowed = {".html", ".css", ".js", ".jpg", ".jpeg", ".png", ".ico", ".svg"}
+    safe = (FRONTEND_DIR / path).resolve()
+
+    # Path traversal mühafizəsi
+    try:
+        safe.relative_to(FRONTEND_DIR.resolve())
+    except ValueError:
+        return "Forbidden", 403
+
+    if not safe.is_file():
+        return "Tapılmadı", 404
+
+    if safe.suffix.lower() not in allowed:
+        return "Forbidden", 403
+
+    return send_from_directory(FRONTEND_DIR, path)
+
+
+# ════════════════════════════════════════════════════════════
+#  BAŞLANĞIC
+# ════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  Viva La Diva Bakery — Flask Server")
+    print(f"  Lab rejimi:      {WEBSEC_LAB}")
+    print(f"  SQLi aktiv:      {DEV_INSECURE_SQL}")
+    print(f"  Auth bypass:     {DEV_AUTH_BYPASS}")
+    print("=" * 50)
+    app.run(debug=True, port=5000)
+
+-- ============================================================
+-- Viva La Diva Bakery — PostgreSQL qurulumu
+-- ============================================================
+
+-- Cədvəlləri əvvəlcə sil (yenidən qurmaq üçün)
+DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS products CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+
+-- 1. İstifadəçilər
+CREATE TABLE users (
+    id            SERIAL PRIMARY KEY,
+    email         VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name     VARCHAR(255),
+    role          VARCHAR(50) DEFAULT 'user',   -- 'user' və ya 'admin'
+    created_at    TIMESTAMP DEFAULT NOW()
+);
+
+-- 2. Məhsullar (menyu)
+CREATE TABLE products (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    description TEXT,
+    price       NUMERIC(10,2) NOT NULL,
+    category    VARCHAR(100)
+);
+
+-- 3. Sifarişlər
+CREATE TABLE orders (
+    id           SERIAL PRIMARY KEY,
+    user_id      INTEGER REFERENCES users(id),
+    product_name VARCHAR(255) NOT NULL,
+    quantity     INTEGER DEFAULT 1,
+    total        NUMERIC(10,2),
+    status       VARCHAR(50) DEFAULT 'pending',
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================================
+-- Nümunə məlumatlar
+-- ============================================================
+
+-- Admin istifadəçi (parol: admin123)
+INSERT INTO users (email, password_hash, full_name, role) VALUES
+('admin@vivaladiva.com',
+ 'pbkdf2:sha256:260000$example$hashedpassword',
+ 'Admin User', 'admin');
+
+-- Menyu məhsulları
+INSERT INTO products (name, description, price, category) VALUES
+('Cheesecake',          'Klassik New York cheesecake',         16.00, 'cake'),
+('Chocolate Lava Cake', 'İsti şokolad lava tort',              15.00, 'cake'),
+('Red Velvet Cake',     'Qırmızı məxmər tort',                 12.00, 'cake'),
+('Chocolate Chip Muffin','Şokoladlı muffin',                   11.00, 'muffin'),
+('Banana Nut Muffin',   'Banan və qoz muffin',                 10.00, 'muffin'),
+('Jelly Filled Donut',  'Meyvəli jele ilə donut',               9.00, 'donut');
