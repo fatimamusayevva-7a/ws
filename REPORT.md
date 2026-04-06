@@ -126,15 +126,6 @@ CREATE TABLE orders (
 );
 ```
 
-### 3.4. Replit-də deploy
-
-Layihə Replit platformasında yerləşdirilib. Replit Agent avtomatik olaraq:
-- Flask, psycopg2, werkzeug kitabxanalarını qurdu
-- PostgreSQL verilənlər bazasını yaratdı
-- `setup.sql` faylını icra edərək cədvəlləri yaratdı
-- Flask serverini işə saldı
-
----
 
 ## 4. Backend: əsas komponentlər
 
